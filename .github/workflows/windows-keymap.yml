@@ -1,0 +1,68 @@
+name: Windows x64 keymap installer
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      VERSION_NUM: v1.7.7-20261124
+      XMAKE_GLOBALDIR: D:\xmake_global
+    steps:
+      - name: Checkout the pinned release with keymap patch
+        uses: actions/checkout@v5
+        with:
+          ref: release-1.7.7-keymap
+          persist-credentials: false
+          submodules: recursive
+      - name: Apply and verify source patch
+        shell: bash
+        run: |
+          git apply --check crossdesk-modifier-mapping.patch
+          git apply crossdesk-modifier-mapping.patch
+          git diff --check
+      - name: Cache Xmake dependencies
+        uses: actions/cache@v5
+        with:
+          path: D:\xmake_global\.xmake\packages
+          key: crossdesk-keymap-win-x64-deps-v1
+      - name: Ensure Xmake
+        uses: ./.github/actions/ensure-xmake
+        with:
+          minimum-version: "3.1.1"
+      - name: Update Xmake repos
+        run: xmake repo -u
+      - name: Prepare installer plugins
+        shell: powershell
+        run: |
+          $nsisPluginDir = "C:\Program Files (x86)\NSIS\Plugins\x86-unicode"
+          $url = "https://github.com/DigitalMediaServer/NSIS-INetC-plugin/releases/download/v1.0.5.7/InetC.zip"
+          $out = "$env:RUNNER_TEMP\InetC.zip"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          Expand-Archive $out -DestinationPath "$env:RUNNER_TEMP\InetC" -Force
+          Copy-Item "$env:RUNNER_TEMP\InetC\x86-unicode\INetC.dll" $nsisPluginDir -Force
+          Copy-Item "apps\desktop\scripts\windows\nsProcess.dll" $nsisPluginDir -Force
+      - name: Build Windows x64
+        run: |
+          xmake f -p windows -a x64 -m release --CROSSDESK_VERSION=$env:VERSION_NUM --USE_CUDA=false -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake b -vy crossdesk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package unsigned installer
+        shell: pwsh
+        run: |
+          & "apps\desktop\scripts\windows\pkg_x64.ps1" $env:VERSION_NUM
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = "apps\desktop\scripts\windows\crossdesk-win-x64-$env:VERSION_NUM.exe"
+          if (!(Test-Path $exe)) { throw "Installer missing: $exe" }
+          Rename-Item $exe "CrossDesk-Keymap-v1.7.7-windows-x64.exe"
+          Get-FileHash "apps\desktop\scripts\windows\CrossDesk-Keymap-v1.7.7-windows-x64.exe" -Algorithm SHA256
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: CrossDesk-Keymap-v1.7.7-windows-x64
+          path: apps/desktop/scripts/windows/CrossDesk-Keymap-v1.7.7-windows-x64.exe
+          if-no-files-found: error
+          retention-days: 14
