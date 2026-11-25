@@ -1,0 +1,378 @@
+diff --git a/apps/desktop/src/config_center/modifier_mapping.h b/apps/desktop/src/config_center/modifier_mapping.h
+new file mode 100644
+--- /dev/null
++++ b/apps/desktop/src/config_center/modifier_mapping.h
+@@ -0,0 +1,60 @@
++#ifndef CROSSDESK_MODIFIER_MAPPING_H_
++#define CROSSDESK_MODIFIER_MAPPING_H_
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <utility>
++
++namespace crossdesk {
++// Order: Control, Windows/Command, Alt/Option, Shift.
++using ModifierMapping = std::array<int, 4>;
++inline constexpr ModifierMapping kDefaultModifierMapping{{0, 1, 2, 3}};
++
++inline bool ValidModifierMapping(const ModifierMapping& mapping) {
++  unsigned seen = 0;
++  for (int target : mapping) {
++    if (target < 0 || target >= 4 || (seen & (1u << target))) return false;
++    seen |= 1u << target;
++  }
++  return true;
++}
++
++// Selecting an occupied target swaps the two assignments; no collisions.
++inline ModifierMapping ChooseModifier(ModifierMapping mapping, int source, int target) {
++  if (!ValidModifierMapping(mapping) || source < 0 || source >= 4 ||
++      target < 0 || target >= 4) return mapping;
++  for (int i = 0; i < 4; ++i) {
++    if (mapping[i] == target) {
++      std::swap(mapping[source], mapping[i]);
++      break;
++    }
++  }
++  return mapping;
++}
++
++template <typename Key>
++inline void MapModifierKey(Key& key, const ModifierMapping& mapping) {
++  // CrossDesk's existing wire representation uses Windows virtual key values.
++  constexpr std::size_t vk[4][2] = {{0xa2, 0xa3}, {0x5b, 0x5c},
++                                   {0xa4, 0xa5}, {0xa0, 0xa1}};
++  constexpr uint32_t scan[4][2] = {{0x1d, 0x1d}, {0x5b, 0x5c},
++                                   {0x38, 0x38}, {0x2a, 0x36}};
++  constexpr bool extended[4][2] = {{false, true}, {true, true},
++                                    {false, true}, {false, false}};
++  if (!ValidModifierMapping(mapping)) return;
++  for (int source = 0; source < 4; ++source) {
++    for (int side = 0; side < 2; ++side) {
++      if (key.key_value != vk[source][side]) continue;
++      const int target = mapping[source];
++      if (source != target) {
++        key.key_value = vk[target][side];
++        key.scan_code = scan[target][side];
++        key.extended = extended[target][side];
++      }
++      return;
++    }
++  }
++}
++}  // namespace crossdesk
++#endif
+diff --git a/apps/desktop/src/config_center/config_center.h b/apps/desktop/src/config_center/config_center.h
+--- a/apps/desktop/src/config_center/config_center.h
++++ b/apps/desktop/src/config_center/config_center.h
+@@ -15,6 +15,7 @@
+ #include <optional>
+ #include <utility>
+ #include <string>
++#include "modifier_mapping.h"
+ 
+ 
+ namespace crossdesk {
+@@ -67,6 +68,8 @@
+   int SetTrustedDevicesOnly(bool enabled);
+   int SetSaveRemotePreviews(bool enabled);
+   int SetPauseVideoWhenMinimized(bool enabled);
++  int SetModifierMapping(const std::string& device, const ModifierMapping& mapping);
++  ModifierMapping GetModifierMapping(const std::string& device) const;
+   int SetInputSensitivity(const std::string& device, int mouse_percent, int wheel_percent);
+   int SetStreamWindowSize(const std::string& device, StreamWindowSize size);
+   int SetPortableServicePromptSuppressed(bool suppressed);
+@@ -149,6 +152,8 @@
+   std::atomic<int> mouse_sensitivity_percent_{100};
+   int legacy_wheel_sensitivity_percent_ = 100;
+   std::map<std::string, int> device_wheel_sensitivity_;
++  mutable std::mutex modifier_mapping_mutex_;
++  std::map<std::string, ModifierMapping> device_modifier_mappings_;
+   bool portable_service_prompt_suppressed_ = false;
+   std::string last_presented_release_;
+   std::string file_transfer_save_path_ = "";
+diff --git a/apps/desktop/src/config_center/config_center.cpp b/apps/desktop/src/config_center/config_center.cpp
+--- a/apps/desktop/src/config_center/config_center.cpp
++++ b/apps/desktop/src/config_center/config_center.cpp
+@@ -229,6 +229,28 @@
+       if (!device.empty() && value.is_number_integer() &&
+           IsValidInputSensitivity(value.get<std::int64_t>()))
+         device_wheel_sensitivity_.emplace(device, value.get<int>());
++    }
++  }
++  {
++    std::lock_guard lock(modifier_mapping_mutex_);
++    device_modifier_mappings_.clear();
++    const auto mappings = nlohmann::json::parse(
++        ini_->GetValue(section_, "device_modifier_mappings", "{}"), nullptr, false);
++    if (mappings.is_object()) {
++      for (const auto& [device, value] : mappings.items()) {
++        if (device.empty() || !value.is_array() || value.size() != 4) continue;
++        ModifierMapping mapping{};
++        bool valid = true;
++        for (int i = 0; i < 4; ++i) {
++          if (!value[i].is_number_integer() || value[i] < 0 || value[i] > 3) {
++            valid = false;
++            break;
++          }
++          mapping[i] = value[i].get<int>();
++        }
++        if (valid && ValidModifierMapping(mapping))
++          device_modifier_mappings_.emplace(device, mapping);
++      }
+     }
+   }
+   auto sizes = nlohmann::json::parse(
+@@ -675,6 +697,25 @@
+   return pause_video_when_minimized_.load();
+ }
+ 
++ModifierMapping ConfigCenter::GetModifierMapping(const std::string& device) const {
++  std::lock_guard lock(modifier_mapping_mutex_);
++  const auto found = device_modifier_mappings_.find(device);
++  return found == device_modifier_mappings_.end() ? kDefaultModifierMapping : found->second;
++}
++
++int ConfigCenter::SetModifierMapping(const std::string& device,
++                                     const ModifierMapping& mapping) {
++  if (device.empty() || !ValidModifierMapping(mapping)) return -1;
++  std::lock_guard lock(modifier_mapping_mutex_);
++  auto mappings = device_modifier_mappings_;
++  if (mapping == kDefaultModifierMapping) mappings.erase(device);
++  else mappings[device] = mapping;
++  if (StoreValues({{"device_modifier_mappings", nlohmann::json(mappings).dump()}}) != 0)
++    return -1;
++  device_modifier_mappings_ = std::move(mappings);
++  return 0;
++}
++
+ int ConfigCenter::GetWheelSensitivityPercent(const std::string& device) const {
+   const auto found = device_wheel_sensitivity_.find(device);
+   return found == device_wheel_sensitivity_.end() ? legacy_wheel_sensitivity_percent_
+diff --git a/apps/desktop/src/gui/runtime/gui_runtime.cpp b/apps/desktop/src/gui/runtime/gui_runtime.cpp
+--- a/apps/desktop/src/gui/runtime/gui_runtime.cpp
++++ b/apps/desktop/src/gui/runtime/gui_runtime.cpp
+@@ -125,11 +125,24 @@
+       scaled.m.s = steps;
+       message = scaled.to_json();
+     }
++#ifdef _WIN32
++    if (!mouse) {
++      auto mapped = action;
++      const auto mapping = config_center_->GetModifierMapping(props->device_preference_key_);
++      if (mapped.type == ControlType::keyboard) {
++        MapModifierKey(mapped.k, mapping);
++      } else if (mapped.type == ControlType::keyboard_state) {
++        for (std::size_t i = 0; i < mapped.ks.pressed_count && i < kMaxKeyboardStateKeys; ++i)
++          MapModifierKey(mapped.ks.pressed_keys[i], mapping);
++      }
++      message = mapped.to_json();
++    }
++#endif
+     if (mouse) {
+       std::lock_guard cursor_lock(props->remote_cursor_state_mutex_);
+       props->cursor_presentation_.NoteInput(SDL_GetTicks());
+     }
+-    // Reuse exactly the leader's mapped coordinates and key metadata. Neither
++    // Reuse the leader's coordinates; keyboard mapping is per destination. Neither
+     // gallery filters nor the follower's preview dimensions affect input.
+     // Move updates supersede old positions and must not wait for KCP retries.
+     // Use the negotiated unreliable stream; clicks and wheel events remain
+diff --git a/apps/desktop/src/gui/application/gui_application.cpp b/apps/desktop/src/gui/application/gui_application.cpp
+--- a/apps/desktop/src/gui/application/gui_application.cpp
++++ b/apps/desktop/src/gui/application/gui_application.cpp
+@@ -2356,6 +2356,36 @@
+     }
+     if (mouse != old_mouse) ResetPointerMotion();
+   });
++#ifdef _WIN32
++  const auto apply_mapping = [](const auto& window, const ModifierMapping& mapping) {
++    window->set_modifier_ctrl(mapping[0]);
++    window->set_modifier_win(mapping[1]);
++    window->set_modifier_alt(mapping[2]);
++    window->set_modifier_shift(mapping[3]);
++  };
++  stream->set_modifier_mapping_visible(true);
++  apply_mapping(stream, config_center_->GetModifierMapping(view.session->device_preference_key_));
++  stream->on_change_modifier_mapping([this, &view, apply_mapping](int source, int target) {
++    const auto& device = view.session->device_preference_key_;
++    const auto previous = config_center_->GetModifierMapping(device);
++    const auto next = source == -1 ? kDefaultModifierMapping
++                                   : ChooseModifier(previous, source, target);
++    if (next == previous) return;
++    // Release using the OLD mapping before changing it, including gallery followers.
++    if (!controlled_remote_id_.empty()) ReleaseControl(true);
++    if (config_center_->SetModifierMapping(device, next) != 0) {
++      apply_mapping(view.window, previous);
++      view.window->set_sensitivity_error(UiText(localization::Literal(
++          "保存失败，请重试", localization_language_index_)));
++      return;
++    }
++    for (auto& [_, other] : ui_->streams) {
++      if (other.session->device_preference_key_ != device) continue;
++      apply_mapping(other.window, next);
++      other.window->set_sensitivity_error("");
++    }
++  });
++#endif
+   stream->on_dismiss_remote_update([&view] {
+     std::lock_guard lock(view.session->remote_version_mutex_);
+     view.session->remote_update_dismissed_ = true;
+diff --git a/apps/desktop/src/gui/ui/stream_window.slint b/apps/desktop/src/gui/ui/stream_window.slint
+--- a/apps/desktop/src/gui/ui/stream_window.slint
++++ b/apps/desktop/src/gui/ui/stream_window.slint
+@@ -32,6 +32,9 @@
+     in-out property <string> settings: "Settings";
+     in-out property <string> mouse-sensitivity: "Pointer sensitivity";
+     in-out property <string> wheel-sensitivity: "Scroll sensitivity";
++    in-out property <string> modifier-mapping: "Modifier keys (this device)";
++    in-out property <string> modifier-reset: "Restore defaults";
++    in-out property <string> modifier-hint: "Selecting an occupied key swaps the assignments.";
+     in-out property <string> remote-resolution: "Resolution";
+     in-out property <string> video-settings-unavailable: "The remote device does not support live video settings";
+     in-out property <string> video-quality: "Video quality";
+@@ -431,6 +434,12 @@
+     in-out property <float> wheel-sensitivity-percent: 100;
+     in property <string> sensitivity-error;
+     callback save-input-sensitivity(int, int);
++    in property <bool> modifier-mapping-visible: false;
++    in property <int> modifier-ctrl: 0;
++    in property <int> modifier-win: 1;
++    in property <int> modifier-alt: 2;
++    in property <int> modifier-shift: 3;
++    callback change-modifier-mapping(int, int);
+     function commit-input-sensitivity() {
+         root.save-input-sensitivity(round(root.mouse-sensitivity-percent), round(root.wheel-sensitivity-percent));
+     }
+@@ -561,6 +570,7 @@
+     private property <length> settings-content-height:
+         (root.video-settings-enabled && root.video-settings-feedback == "" ? 182px : 220px)
+         + 2 * (18px + 4px + 27px + 8px) + (root.sensitivity-error == "" ? 0px : 28px)
++        + (root.modifier-mapping-visible ? 375px : 0px)
+         + (root.remote-resolution-visible ? 57px + (root.remote-resolution-feedback == "" ? 0px : 32px) : 0px);
+     private property <length> video-menu-height: min(root.settings-content-height,
+         max(control.y, video.height - control.y - root.control-toolbar-height) - root.control-panel-gap);
+@@ -1894,6 +1904,40 @@
+                             percent <=> root.wheel-sensitivity-percent;
+                             commit => { root.commit-input-sensitivity(); }
+                         }
++                        if root.modifier-mapping-visible: VerticalLayout {
++                            spacing: 8px;
++                            Text { text: StreamStrings.modifier-mapping; color: #5c626c; font-size: 12px; height: 20px; }
++                            VideoSettingRow {
++                                label: "Ctrl →";
++                                options: ["Ctrl", "Cmd/Win", "Opt/Alt", "Shift"];
++                                selected: root.modifier-ctrl; enabled: true;
++                                choose(index) => { root.change-modifier-mapping(0, index); }
++                            }
++                            VideoSettingRow {
++                                label: "Win →";
++                                options: ["Ctrl", "Cmd/Win", "Opt/Alt", "Shift"];
++                                selected: root.modifier-win; enabled: true;
++                                choose(index) => { root.change-modifier-mapping(1, index); }
++                            }
++                            VideoSettingRow {
++                                label: "Alt →";
++                                options: ["Ctrl", "Cmd/Win", "Opt/Alt", "Shift"];
++                                selected: root.modifier-alt; enabled: true;
++                                choose(index) => { root.change-modifier-mapping(2, index); }
++                            }
++                            VideoSettingRow {
++                                label: "Shift →";
++                                options: ["Ctrl", "Cmd/Win", "Opt/Alt", "Shift"];
++                                selected: root.modifier-shift; enabled: true;
++                                choose(index) => { root.change-modifier-mapping(3, index); }
++                            }
++                            Text { text: StreamStrings.modifier-hint; color: #8b8f95; font-size: 11px; wrap: word-wrap; }
++                            VideoSettingRow {
++                                label: "";
++                                options: [StreamStrings.modifier-reset]; selected: -1; enabled: true;
++                                choose(index) => { root.change-modifier-mapping(-1, 0); }
++                            }
++                        }
+                         if root.sensitivity-error != "": Text {
+                             text: root.sensitivity-error; color: #59636d; font-size: 11px; wrap: word-wrap;
+                         }
+diff --git a/apps/desktop/src/gui/ui/ui_localization.h b/apps/desktop/src/gui/ui/ui_localization.h
+--- a/apps/desktop/src/gui/ui/ui_localization.h
++++ b/apps/desktop/src/gui/ui/ui_localization.h
+@@ -274,6 +274,13 @@
+   strings.set_settings(Text(localization::settings[language]));
+   strings.set_mouse_sensitivity(Text(localization::mouse_sensitivity[language]));
+   strings.set_wheel_sensitivity(Text(localization::wheel_sensitivity[language]));
++  strings.set_modifier_mapping(language == 0 ? "修饰键映射（当前设备）" :
++                               language == 3 ? "修飾鍵映射（目前裝置）" : "Modifier keys (this device)");
++  strings.set_modifier_reset(language == 0 ? "恢复默认" :
++                             language == 3 ? "恢復預設" : "Restore defaults");
++  strings.set_modifier_hint(language == 0 ? "选择已占用的目标键将自动交换映射。" :
++                            language == 3 ? "選擇已占用的目標鍵將自動交換映射。" :
++                                            "Selecting an occupied key swaps the assignments.");
+   strings.set_video_settings_unavailable(
+       Text(localization::video_settings_unavailable[language]));
+   strings.set_video_quality(Text(localization::video_quality[language]));
+diff --git a/apps/desktop/tests/modifier_mapping_test.cpp b/apps/desktop/tests/modifier_mapping_test.cpp
+new file mode 100644
+--- /dev/null
++++ b/apps/desktop/tests/modifier_mapping_test.cpp
+@@ -0,0 +1,60 @@
++#include "../src/config_center/modifier_mapping.h"
++
++#include <algorithm>
++#include <cassert>
++#include <cstdint>
++#include <iostream>
++#include <set>
++
++using namespace crossdesk;
++
++struct Key {
++  std::size_t key_value;
++  uint32_t scan_code;
++  bool extended;
++};
++
++int main() {
++  constexpr std::size_t keys[4][2] = {
++      {0xa2, 0xa3}, {0x5b, 0x5c}, {0xa4, 0xa5}, {0xa0, 0xa1}};
++  constexpr uint32_t scan[4][2] = {
++      {0x1d, 0x1d}, {0x5b, 0x5c}, {0x38, 0x38}, {0x2a, 0x36}};
++  constexpr bool ext[4][2] = {
++      {false, true}, {true, true}, {false, true}, {false, false}};
++  auto mapping = kDefaultModifierMapping;
++  int permutations = 0;
++  do {
++    assert(ValidModifierMapping(mapping));
++    std::set<std::size_t> resulting_keys;
++    for (int source = 0; source < 4; ++source) {
++      for (int side = 0; side < 2; ++side) {
++        Key event{keys[source][side], scan[source][side], ext[source][side]};
++        Key heartbeat = event;
++        MapModifierKey(event, mapping);
++        MapModifierKey(heartbeat, mapping);
++        assert(event.key_value == keys[mapping[source]][side]);
++        assert(event.scan_code == scan[mapping[source]][side]);
++        assert(event.extended == ext[mapping[source]][side]);
++        assert(heartbeat.key_value == event.key_value);
++        assert(heartbeat.scan_code == event.scan_code);
++        assert(heartbeat.extended == event.extended);
++        assert(resulting_keys.insert(event.key_value).second);
++      }
++      for (int target = 0; target < 4; ++target) {
++        auto next = ChooseModifier(mapping, source, target);
++        assert(ValidModifierMapping(next));
++        assert(next[source] == target);
++      }
++    }
++    Key letter{0x41, 0x1e, false};
++    MapModifierKey(letter, mapping);
++    assert(letter.key_value == 0x41 && letter.scan_code == 0x1e && !letter.extended);
++    ++permutations;
++  } while (std::next_permutation(mapping.begin(), mapping.end()));
++  assert(permutations == 24);
++  assert(!ValidModifierMapping({0, 0, 2, 3}));
++  assert(!ValidModifierMapping({-1, 1, 2, 3}));
++  assert(!ValidModifierMapping({0, 1, 2, 4}));
++  assert((ChooseModifier(kDefaultModifierMapping, 0, 1) == ModifierMapping{1, 0, 2, 3}));
++  std::cout << "Passed all 24 mappings, 8 left/right keys, heartbeat consistency and validation.\n";
++}
