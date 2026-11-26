@@ -1,0 +1,301 @@
+diff --git a/src/api/minirtc.h b/src/api/minirtc.h
+--- a/src/api/minirtc.h
++++ b/src/api/minirtc.h
+@@ -168,6 +168,8 @@
+   MaintainResolution = 1,
+   /// Balance frame-rate and resolution adjustments.
+   Balanced = 2,
++  /// Prefer verified low-compression frames; reduce cadence before detail.
++  StrictClarity = 3,
+ };
+ 
+ /// Tag selecting exactly one MiniRtcNativeVideoFramePayload member.
+diff --git a/src/media/resolution_adapter/resolution_adapter.cpp b/src/media/resolution_adapter/resolution_adapter.cpp
+--- a/src/media/resolution_adapter/resolution_adapter.cpp
++++ b/src/media/resolution_adapter/resolution_adapter.cpp
+@@ -297,8 +297,9 @@
+       std::min(limits.front().width * limits.front().height, max_pixels);
+ 
+   const float estimated_pixels_f =
+-      video_degradation_preference_ ==
+-              MiniRtcVideoDegradationPreference::MaintainResolution
++      (video_degradation_preference_ ==
++              MiniRtcVideoDegradationPreference::MaintainResolution ||
++           video_degradation_preference_ == MiniRtcVideoDegradationPreference::StrictClarity)
+           ? static_cast<float>(max_pixels)
+           : std::pow(
+                 static_cast<float>(target_bitrate) / GetBitrateCoefficient(),
+diff --git a/src/pc/peer_connection.cpp b/src/pc/peer_connection.cpp
+--- a/src/pc/peer_connection.cpp
++++ b/src/pc/peer_connection.cpp
+@@ -98,6 +98,7 @@
+   if (value == "maintain_resolution" || value == "quality_priority") {
+     return MiniRtcVideoDegradationPreference::MaintainResolution;
+   }
++  if (value == "strict_clarity") return MiniRtcVideoDegradationPreference::StrictClarity;
+   if (value == "balanced") {
+     return MiniRtcVideoDegradationPreference::Balanced;
+   }
+@@ -115,7 +116,8 @@
+     MiniRtcVideoDegradationPreference value) {
+   if (value == MiniRtcVideoDegradationPreference::MaintainFrameRate ||
+       value == MiniRtcVideoDegradationPreference::MaintainResolution ||
+-      value == MiniRtcVideoDegradationPreference::Balanced) {
++      value == MiniRtcVideoDegradationPreference::Balanced ||
++      value == MiniRtcVideoDegradationPreference::StrictClarity) {
+     return value;
+   }
+   LOG_WARN(
+@@ -130,6 +132,8 @@
+   switch (value) {
+     case MiniRtcVideoDegradationPreference::MaintainFrameRate:
+       return "maintain_frame_rate";
++    case MiniRtcVideoDegradationPreference::StrictClarity:
++      return "strict_clarity";
+     case MiniRtcVideoDegradationPreference::Balanced:
+       return "balanced";
+     case MiniRtcVideoDegradationPreference::MaintainResolution:
+diff --git a/src/rtc/minirtc_inner.cpp b/src/rtc/minirtc_inner.cpp
+--- a/src/rtc/minirtc_inner.cpp
++++ b/src/rtc/minirtc_inner.cpp
+@@ -241,7 +241,7 @@
+       !remote_id_size || quality < MiniRtcVideoQualityLow ||
+       quality > MiniRtcVideoQualityHigh ||
+       (frame_rate != 30 && frame_rate != 60) ||
+-      preference > MiniRtcVideoDegradationPreference::Balanced)
++      preference > MiniRtcVideoDegradationPreference::StrictClarity)
+     return -1;
+   return peer_ptr->peer_connection->UpdateVideoSettings(
+       std::string(remote_id, remote_id_size), quality, frame_rate, preference);
+diff --git a/src/transport/ice_transport_controller.cpp b/src/transport/ice_transport_controller.cpp
+--- a/src/transport/ice_transport_controller.cpp
++++ b/src/transport/ice_transport_controller.cpp
+@@ -1,4 +1,5 @@
+ #include "ice_transport_controller.h"
++#include "strict_clarity_policy.h"
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -58,7 +59,9 @@
+ bool UsesKeyframeSizeBudget(const MediaCodecConfig& config) {
+   return config.video_content_type == MiniRtcVideoContentType::ScreenContent &&
+          config.video_degradation_preference !=
+-             MiniRtcVideoDegradationPreference::MaintainResolution;
++             MiniRtcVideoDegradationPreference::MaintainResolution &&
++         config.video_degradation_preference !=
++             MiniRtcVideoDegradationPreference::StrictClarity;
+ }
+ 
+ }  // namespace
+@@ -839,8 +842,17 @@
+   }
+ 
+   if (task_queue_encode_) {
++    const bool strict_clarity = media_config_.video_degradation_preference ==
++        MiniRtcVideoDegradationPreference::StrictClarity;
++    const int input_width = static_cast<int>(native_frame ? native_frame->width : video_frame->width);
++    const int input_height = static_cast<int>(native_frame ? native_frame->height : video_frame->height);
++    const int capture_fps = strict_clarity
++        ? StrictClarityFps(context->desired_target_bitrate.value_or(media_config_.init_bitrate),
++                           input_width, input_height,
++                           std::min(media_config_.max_frame_rate, context->strict_fps_ceiling))
++        : media_config_.max_frame_rate;
+     if (!video_frame_cadences_[channel_name].Accept(
+-            clock_->CurrentTimeUs(), media_config_.max_frame_rate))
++            clock_->CurrentTimeUs(), capture_fps))
+       return 0;
+     context->capture_input_frame_total.fetch_add(1,
+                                                  std::memory_order_relaxed);
+@@ -855,7 +867,7 @@
+                                             media_config_.min_bitrate, 0);
+       }
+       if (context->video_rate_control.DropFrame(
+-              clock_->CurrentTimeUs(), media_config_.max_frame_rate,
++              clock_->CurrentTimeUs(), capture_fps,
+               keyframe_pending)) {
+         return 0;
+       }
+@@ -915,8 +927,8 @@
+     // Adapt against the viewer's useful source size. This keeps recovery and
+     // bandwidth probes from repeatedly trying to exceed the viewport ceiling.
+     const auto [source_width, source_height] = FitVideoResolution(
+-        raw_frame.Width(), raw_frame.Height(), video_resolution_width_,
+-        video_resolution_height_);
++        raw_frame.Width(), raw_frame.Height(), strict_clarity ? 0 : video_resolution_width_,
++        strict_clarity ? 0 : video_resolution_height_);
+     if (context->source_width <= 0 || context->source_height <= 0 ||
+         context->source_width != source_width ||
+         context->source_height != source_height) {
+@@ -942,6 +954,15 @@
+       context->post_upgrade_protection_until_ms = 0;
+     }
+ 
++    if (strict_clarity && resolution_adapter_) {
++      int width = source_width, height = source_height;
++      if (resolution_adapter_->GetResolution(std::numeric_limits<int>::max(),
++              source_width, source_height, &width, &height) == 0) {
++        context->target_width = width;
++        context->target_height = height;
++      }
++    }
++
+     // Consume a key-frame request only after this frame is known to be
+     // accepted by the encode queue. Otherwise a busy queue would drop both
+     // the captured frame and the one-shot FIR request.
+@@ -1020,6 +1041,7 @@
+     const int target_height = target_resolution.second;
+     encode_queue->PostTask([weak_self, weak_context, encode_queue, channel_name,
+                             force_i_frame, target_width, target_height, settings_generation,
++                            strict_clarity, capture_fps,
+ #if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_DEBUG
+                             sample_timings, timing_generation = context->encode_timing_generation,
+ #endif
+@@ -1091,12 +1113,24 @@
+             context->video_settings_generation != settings_generation) return;
+         const int64_t input_time_ms = self->clock_->CurrentTimeMs();
+         context->video_rate_control.OnEncoderInput(input_time_ms);
+-        input_frame_rate = context->encoder_input_cadence.Observe(
+-            input_time_ms, self->media_config_.max_frame_rate);
++        if (strict_clarity) {
++          if (context->applied_input_frame_rate != capture_fps) {
++            input_frame_rate = capture_fps;
++            context->applied_input_frame_rate = capture_fps;
++          }
++        } else {
++          input_frame_rate = context->encoder_input_cadence.Observe(
++              input_time_ms, self->media_config_.max_frame_rate);
++        }
+       }
+       // Already on the encode queue. Feed cadence even when bitrate stayed
+       // unchanged, without posting rate tasks that compete with frame work.
+-      if (input_frame_rate &&
++      if (input_frame_rate && strict_clarity) {
++        if (context->codec->SupportsInputFrameRateUpdates())
++          context->codec->SetInputFrameRate(*input_frame_rate);
++        else
++          context->codec->SetTargetFrameRate(*input_frame_rate);
++      } else if (input_frame_rate &&
+           context->codec->SupportsInputFrameRateUpdates() &&
+           context->codec->SetInputFrameRate(*input_frame_rate) == 0) {
+         std::unique_lock lock(self->stream_senders_mutex_);
+@@ -1242,7 +1276,8 @@
+       MiniRtcVideoDegradationPreference::MaintainFrameRate;
+   const bool maintain_resolution =
+       media_config_.video_degradation_preference ==
+-      MiniRtcVideoDegradationPreference::MaintainResolution;
++      MiniRtcVideoDegradationPreference::MaintainResolution ||
++      media_config_.video_degradation_preference == MiniRtcVideoDegradationPreference::StrictClarity;
+   const bool balanced = media_config_.video_degradation_preference ==
+                         MiniRtcVideoDegradationPreference::Balanced;
+   const int minimum_frame_rate = VideoAdaptationPolicy::MinimumFrameRate(
+@@ -2204,6 +2239,34 @@
+       context->FinishStartupKeyframe();
+       budget = context->keyframe_size_budget_bytes;
+     }
++    if (media_config_.video_degradation_preference ==
++        MiniRtcVideoDegradationPreference::StrictClarity) {
++      const auto& stats = encoded_frame.QualityStats();
++      const bool quality_ok = StrictClarityAcceptsQp(stats.HasQp(), stats.NormalizedQp());
++      const bool size_ok = encoded_frame.EncodedWidth() ==
++              static_cast<uint32_t>(context->target_width.value_or(context->source_width)) &&
++          encoded_frame.EncodedHeight() ==
++              static_cast<uint32_t>(context->target_height.value_or(context->source_height));
++      if (!quality_ok || !size_ok) {
++        // A discarded delta may be a reference for future deltas. Wait for a
++        // fresh sharp keyframe before continuing the receiver's reference chain.
++        context->strict_good_frames = 0;
++        context->strict_fps_ceiling = std::max(1, context->strict_fps_ceiling / 2);
++        context->awaiting_budget_keyframe = true;
++        context->discarded_keyframe_capture_us = std::max(
++            context->discarded_keyframe_capture_us, encoded_frame.CapturedTimestamp());
++        FullIntraRequest(channel_name);
++        return 0;
++      }
++      if (context->awaiting_budget_keyframe && !keyframe) {
++        FullIntraRequest(channel_name);
++        return 0;
++      }
++      if (++context->strict_good_frames >= std::max(6, context->strict_fps_ceiling * 3)) {
++        context->strict_good_frames = 0;
++        context->strict_fps_ceiling = std::min(30, context->strict_fps_ceiling + 2);
++      }
++    }
+     if (budget > 0 && keyframe && encoded_frame.Size() > budget) {
+       bool startup_retry = false;
+       if (context->startup_keyframe_pending) {
+@@ -3181,6 +3244,9 @@
+       context->codec = std::move(prepared.codec);
+       ++context->video_settings_generation;
+       context->video_rate_control.Reset();
++      context->strict_fps_ceiling = 30;
++      context->strict_good_frames = 0;
++      context->applied_input_frame_rate = 0;
+       context->encoding_speed_priority_enabled =
+           prepared.speed_priority;
+       context->encoding_speed_priority_update_generation.reset();
+@@ -3209,7 +3275,7 @@
+       context->ResetEncoderQualityTracking();
+       context->ResetEncodeQueueDelayTracking();
+       context->post_upgrade_protection_until_ms = 0;
+-      context->awaiting_budget_keyframe = false;
++      context->awaiting_budget_keyframe = preference == MiniRtcVideoDegradationPreference::StrictClarity;
+       context->keyframe_budget_retry_count = 0;
+       context->discarded_keyframe_capture_us = 0;
+       context->keyframe_size_budget_bytes = 0;
+@@ -3677,7 +3743,8 @@
+             MiniRtcVideoDegradationPreference::MaintainFrameRate;
+         const bool allow_spatial_downgrade =
+             media_config_.video_degradation_preference !=
+-            MiniRtcVideoDegradationPreference::MaintainResolution;
++            MiniRtcVideoDegradationPreference::MaintainResolution &&
++            media_config_.video_degradation_preference != MiniRtcVideoDegradationPreference::StrictClarity;
+         const bool is_screen_content =
+             media_config_.video_content_type ==
+             MiniRtcVideoContentType::ScreenContent;
+@@ -3700,6 +3767,8 @@
+           }
+           const int sub_target_bitrate = static_cast<int>(context->fec_protection.media_bitrate_bps);
+ 
++          if (media_config_.video_degradation_preference ==
++              MiniRtcVideoDegradationPreference::StrictClarity) continue;
+           int source_width = context->source_width;
+           int source_height = context->source_height;
+           // A viewport change clears these dimensions until the next captured
+diff --git a/src/transport/ice_transport_controller.h b/src/transport/ice_transport_controller.h
+--- a/src/transport/ice_transport_controller.h
++++ b/src/transport/ice_transport_controller.h
+@@ -262,6 +262,8 @@
+     std::optional<int> applied_target_bitrate;
+     bool bitrate_update_queued = false;
+     VideoEncoderRateControl video_rate_control;
++    int strict_fps_ceiling = 30;
++    int strict_good_frames = 0;
+     VideoSendDiagnostics video_send_diagnostics;
+     EncoderInputCadence encoder_input_cadence;
+     int applied_input_frame_rate = 0;
+diff --git a/src/transport/strict_clarity_policy.h b/src/transport/strict_clarity_policy.h
+new file mode 100644
+--- /dev/null
++++ b/src/transport/strict_clarity_policy.h
+@@ -0,0 +1,21 @@
++#ifndef MINIRTC_STRICT_CLARITY_POLICY_H_
++#define MINIRTC_STRICT_CLARITY_POLICY_H_
++#include <algorithm>
++#include <cstdint>
++#include <cmath>
++namespace minirtc {
++inline int StrictClarityFps(int bitrate, int width, int height, int ceiling) {
++  ceiling = std::clamp(ceiling, 1, 30);
++  const double pixels = static_cast<double>(std::max(1, width)) * std::max(1, height);
++  // Reserve around 0.08 bits/pixel/frame for desktop detail. This is an
++  // admission estimate, not a promise about visual quality.
++  const double fps = std::max(0, bitrate) / (pixels * 0.08);
++  return std::max(1, static_cast<int>(std::min<double>(ceiling, fps)));
++}
++inline bool StrictClarityAcceptsQp(bool available, float normalized_qp) {
++  // Conservative H264/AV1 normalized QP proxy; unknown quality is not verified.
++  return available && std::isfinite(normalized_qp) && normalized_qp >= 0 &&
++         normalized_qp <= 0.55f;
++}
++}
++#endif
