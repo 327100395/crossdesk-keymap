@@ -1,0 +1,131 @@
+diff --git a/apps/desktop/src/gui/application/gui_application.cpp b/apps/desktop/src/gui/application/gui_application.cpp
+--- a/apps/desktop/src/gui/application/gui_application.cpp
++++ b/apps/desktop/src/gui/application/gui_application.cpp
+@@ -2522,7 +2522,8 @@
+       return;
+     RemoteAction action{};
+     action.type = ControlType::video_settings;
+-    action.vs = {quality, frame_rate_index == 0 ? 30 : 60, preference};
++    action.vs = {preference == 3 ? 2 : quality,
++                 preference == 3 ? 30 : (frame_rate_index == 0 ? 30 : 60), preference};
+     if (frame_rate_index < 0 || frame_rate_index > 1 ||
+         !ValidVideoSettings(action.vs))
+       return;
+@@ -4162,10 +4163,23 @@
+                                      props->video_settings_supported_);
+     stream->set_video_settings_feedback(UiText(
+         props->video_settings_failed_
+-            ? localization::video_settings_failed[localization_language_index_] : ""));
++            ? localization::video_settings_failed[localization_language_index_] :
++            props->video_settings_.preference == 3
++                ? (localization_language_index_ == 0 ? "极致清晰：网络不足时保留上一帧，画面可能暂停。" :
++                   localization_language_index_ == 3 ? "極致清晰：網路不足時保留上一幀，畫面可能暫停。" :
++                   "Ultra clear: video may pause while waiting for a clear frame.")
++                : ""));
+     stream->set_video_quality_index(props->video_settings_.quality);
+     stream->set_frame_rate_index(props->video_settings_.frame_rate == 30 ? 0 : 1);
+     stream->set_adaptation_policy_index(props->video_settings_.preference);
++    const auto received = props->received_video_stats_.Get();
++    const bool waiting = props->applied_video_settings_.preference == 3 &&
++        props->applied_video_settings_.accepted &&
++        (received.width == 0 || received.fps.value_or(1) == 0);
++    stream->set_strict_clarity_warning(waiting ?
++        UiText(localization_language_index_ == 0 ? "正在等待清晰帧，当前画面可能已过时。" :
++               localization_language_index_ == 3 ? "正在等待清晰幀，目前畫面可能已過時。" :
++               "Waiting for a clear frame; displayed image may be stale.") : UiText(""));
+   }
+   view.ObserveWindowState();
+   stream->set_stats_visible(props->net_traffic_stats_button_pressed_);
+diff --git a/apps/desktop/src/gui/ui/stream_window.slint b/apps/desktop/src/gui/ui/stream_window.slint
+--- a/apps/desktop/src/gui/ui/stream_window.slint
++++ b/apps/desktop/src/gui/ui/stream_window.slint
+@@ -45,6 +45,7 @@
+     in-out property <string> quality-high: "High";
+     in-out property <string> priority-frame-rate: "Frame rate";
+     in-out property <string> priority-quality: "Quality";
++    in-out property <string> priority-clarity: "Ultra clear";
+     in-out property <string> priority-balanced: "Balanced";
+ 
+     in-out property <string> select-display: "Select Display";
+@@ -399,6 +400,7 @@
+     in property <string> status-text: "";
+     in property <string> receiving-text: "";
+     in property <string> service-warning: "";
++    in property <string> strict-clarity-warning: "";
+     private property <bool> service-warning-expired: false;
+     changed service-warning => {
+         if root.service-warning == "" { root.service-warning-expired = false; }
+@@ -1886,7 +1888,7 @@
+                         }
+                         VideoSettingRow {
+                             label: StreamStrings.adaptation-policy;
+-                            options: [StreamStrings.priority-frame-rate, StreamStrings.priority-quality, StreamStrings.priority-balanced];
++                            options: [StreamStrings.priority-frame-rate, StreamStrings.priority-quality, StreamStrings.priority-balanced, StreamStrings.priority-clarity];
+                             selected: root.adaptation-policy-index; enabled: root.video-settings-enabled;
+                             choose(index) => { root.change-video-settings(root.video-quality-index, root.frame-rate-index, index); }
+                         }
+@@ -2052,6 +2054,20 @@
+                     scroll-event(event) => { accept }
+                 }
+             }
++            if root.strict-clarity-warning != "" && !root.modal-visible: FlatSurface {
++                x: 12px; y: parent.height - self.height - 12px;
++                width: min(340px, parent.width - 24px);
++                height: strict-warning-text.preferred-height + 16px;
++                background: #fff4d6;
++                outline-color: #e8c56a;
++                border-radius: UiRadius.surface;
++                z: 12;
++                strict-warning-text := Text {
++                    x: 8px; y: 8px; width: parent.width - 16px;
++                    text: root.strict-clarity-warning; color: #805b12;
++                    font-size: 12px; wrap: word-wrap;
++                }
++            }
+             if root.service-warning != "" && !root.service-warning-expired && !root.modal-visible: FlatSurface {
+                 x: (parent.width - self.width) / 2;
+                 y: 12px;
+diff --git a/apps/desktop/src/gui/ui/ui_localization.h b/apps/desktop/src/gui/ui/ui_localization.h
+--- a/apps/desktop/src/gui/ui/ui_localization.h
++++ b/apps/desktop/src/gui/ui/ui_localization.h
+@@ -274,6 +274,7 @@
+   strings.set_settings(Text(localization::settings[language]));
+   strings.set_mouse_sensitivity(Text(localization::mouse_sensitivity[language]));
+   strings.set_wheel_sensitivity(Text(localization::wheel_sensitivity[language]));
++  strings.set_priority_clarity(language == 0 ? "极致清晰" : language == 3 ? "極致清晰" : "Ultra clear");
+   strings.set_modifier_mapping(language == 0 ? "修饰键映射（当前设备）" :
+                                language == 3 ? "修飾鍵映射（目前裝置）" : "Modifier keys (this device)");
+   strings.set_modifier_reset(language == 0 ? "恢复默认" :
+diff --git a/libs/wire/include/preview_subscription.h b/libs/wire/include/preview_subscription.h
+--- a/libs/wire/include/preview_subscription.h
++++ b/libs/wire/include/preview_subscription.h
+@@ -95,7 +95,7 @@
+            result.fps != 15 && result.fps != 60) ||
+           result.quality < 0 || result.quality > 2 ||
+           (result.frame_rate != 30 && result.frame_rate != 60) ||
+-          result.preference < 0 || result.preference > 2)
++          result.preference < 0 || result.preference > 3)
+         return {};
+       if (json.contains("audio")) {
+         if (!json.at("audio").is_boolean())
+diff --git a/libs/wire/include/remote_action.h b/libs/wire/include/remote_action.h
+--- a/libs/wire/include/remote_action.h
++++ b/libs/wire/include/remote_action.h
+@@ -185,7 +185,7 @@
+ struct VideoSettings {
+   int quality;     // 0: low, 1: medium, 2: high
+   int frame_rate;  // 30 or 60
+-  int preference;  // 0: frame rate, 1: quality, 2: balanced
++  int preference;  // 0: frame rate, 1: quality, 2: balanced, 3: strict clarity
+   uint32_t request_id;
+   bool accepted;  // Only meaningful in video_settings_status.
+ };
+@@ -197,7 +197,7 @@
+ inline bool ValidVideoSettings(const VideoSettings& settings) {
+   return settings.quality >= 0 && settings.quality <= 2 &&
+          (settings.frame_rate == 30 || settings.frame_rate == 60) &&
+-         settings.preference >= 0 && settings.preference <= 2;
++         settings.preference >= 0 && settings.preference <= 3;
+ }
+ 
+ inline constexpr std::size_t kMaxTextInputBytes = 16 * 1024;
