@@ -1,0 +1,300 @@
+diff --git a/apps/desktop/src/config_center/config_center.cpp b/apps/desktop/src/config_center/config_center.cpp
+--- a/apps/desktop/src/config_center/config_center.cpp
++++ b/apps/desktop/src/config_center/config_center.cpp
+@@ -208,6 +208,7 @@
+   privacy_black_screen_.store(ini_->GetBoolValue(section_, "privacy_black_screen", false));
+   lock_on_disconnect_.store(
+       ini_->GetBoolValue(section_, "lock_on_disconnect", true));
++  keep_mac_awake_.store(ini_->GetBoolValue(section_, "keep_mac_awake", false));
+   trusted_devices_only_.store(
+       ini_->GetValue(section_, "trusted_devices_only", nullptr) != nullptr &&
+       ini_->GetBoolValue(section_, "trusted_devices_only", true));
+@@ -360,6 +361,7 @@
+                     privacy_local_unlock_allowed_.load());
+   ini_->SetBoolValue(section_, "privacy_black_screen", privacy_black_screen_.load());
+   ini_->SetBoolValue(section_, "lock_on_disconnect", lock_on_disconnect_.load());
++  ini_->SetBoolValue(section_, "keep_mac_awake", keep_mac_awake_.load());
+   ini_->SetBoolValue(section_, "trusted_devices_only", trusted_devices_only_.load());
+   ini_->SetBoolValue(section_, "save_remote_previews",
+                     save_remote_previews_.load());
+@@ -673,6 +675,17 @@
+   return lock_on_disconnect_.load();
+ }
+ 
++int ConfigCenter::SetKeepMacAwake(bool enabled) {
++  if (StoreValues({{"keep_mac_awake", enabled ? "true" : "false"}}) != 0)
++    return -1;
++  keep_mac_awake_.store(enabled);
++  return 0;
++}
++
++bool ConfigCenter::IsKeepMacAwake() const {
++  return keep_mac_awake_.load();
++}
++
+ int ConfigCenter::SetSaveRemotePreviews(bool enabled) {
+   if (StoreValues({{"save_remote_previews", enabled ? "true" : "false"}}) != 0) {
+     return -1;
+diff --git a/apps/desktop/src/config_center/config_center.h b/apps/desktop/src/config_center/config_center.h
+--- a/apps/desktop/src/config_center/config_center.h
++++ b/apps/desktop/src/config_center/config_center.h
+@@ -65,6 +65,7 @@
+   int SetPrivacyLocalUnlock(bool allowed);
+   int SetPrivacyBlackScreen(bool enabled);
+   int SetLockOnDisconnect(bool enabled);
++  int SetKeepMacAwake(bool enabled);
+   int SetTrustedDevicesOnly(bool enabled);
+   int SetSaveRemotePreviews(bool enabled);
+   int SetPauseVideoWhenMinimized(bool enabled);
+@@ -99,6 +100,7 @@
+   bool IsPrivacyLocalUnlockAllowed() const;
+   bool IsPrivacyBlackScreen() const { return privacy_black_screen_.load(); }
+   bool IsLockOnDisconnect() const;
++  bool IsKeepMacAwake() const;
+   bool IsTrustedDevicesOnly() const;
+   bool IsSaveRemotePreviews() const;
+   bool IsPauseVideoWhenMinimized() const;
+@@ -146,6 +148,7 @@
+   std::atomic<bool> privacy_local_unlock_allowed_{true};
+   std::atomic<bool> privacy_black_screen_{false};
+   std::atomic<bool> lock_on_disconnect_{true};
++  std::atomic<bool> keep_mac_awake_{false};
+   std::atomic<bool> trusted_devices_only_{false};
+   std::atomic<bool> save_remote_previews_{true};
+   std::atomic<bool> pause_video_when_minimized_{true};
+diff --git a/apps/desktop/src/gui/application/gui_application.cpp b/apps/desktop/src/gui/application/gui_application.cpp
+--- a/apps/desktop/src/gui/application/gui_application.cpp
++++ b/apps/desktop/src/gui/application/gui_application.cpp
+@@ -1728,6 +1728,10 @@
+   main->set_privacy_black_screen(config_center_->IsPrivacyBlackScreen());
+ #endif
+   main->set_lock_on_disconnect_enabled(config_center_->IsLockOnDisconnect());
++#ifdef __APPLE__
++  main->set_keep_mac_awake_available(true);
++  main->set_keep_mac_awake_enabled(config_center_->IsKeepMacAwake());
++#endif
+   main->set_trusted_devices_only(config_center_->IsTrustedDevicesOnly());
+ #if defined(_WIN32) || defined(__APPLE__) || (defined(__linux__) && !defined(__OHOS__))
+   main->set_privacy_setting_available(true);
+@@ -5077,6 +5081,14 @@
+       LOG_ERROR("Failed to restore DeskHub settings after lock preference save failure");
+     main->set_settings_save_error(UiText(
+         localization::Literal("无法保存断开后锁屏设置，请重试。", localization_language_index_)));
++    return false;
++  }
++#endif
++#ifdef __APPLE__
++  if (config_center_->SetKeepMacAwake(main->get_keep_mac_awake_enabled()) != 0) {
++    if (wall_changed) ui_->gallery.Save(ui_->gallery_path);
++    main->set_settings_save_error(UiText(
++        localization::Literal("保存失败，请重试", localization_language_index_)));
+     return false;
+   }
+ #endif
+diff --git a/apps/desktop/src/gui/features/devices/screen_sharing_power.cpp b/apps/desktop/src/gui/features/devices/screen_sharing_power.cpp
+--- a/apps/desktop/src/gui/features/devices/screen_sharing_power.cpp
++++ b/apps/desktop/src/gui/features/devices/screen_sharing_power.cpp
+@@ -93,25 +93,30 @@
+   IOPMAssertionID display = kIOPMNullAssertionID;
+   IOPMAssertionID system = kIOPMNullAssertionID;
+ 
+-  void Start() {
+-    const auto reason = CFSTR("CrossDesk is sharing the desktop");
+-    auto result = IOPMAssertionCreateWithName(
+-        kIOPMAssertionTypePreventUserIdleSystemSleep, kIOPMAssertionLevelOn,
+-        reason, &system);
+-    if (result != kIOReturnSuccess)
+-      LOG_WARN("Cannot prevent system idle sleep: {}", result);
+-    result = IOPMAssertionCreateWithName(
+-        kIOPMAssertionTypePreventUserIdleDisplaySleep, kIOPMAssertionLevelOn,
+-        reason, &display);
+-    if (result != kIOReturnSuccess)
+-      LOG_WARN("Cannot prevent display idle sleep: {}", result);
+-  }
+-
+-  void Stop() {
+-    if (display != kIOPMNullAssertionID) IOPMAssertionRelease(display);
+-    if (system != kIOPMNullAssertionID) IOPMAssertionRelease(system);
+-    display = system = kIOPMNullAssertionID;
+-  }
++  static void UpdateAssertion(IOPMAssertionID& assertion, bool needed,
++                              CFStringRef type, CFStringRef reason) {
++    if (needed && assertion == kIOPMNullAssertionID) {
++      IOPMAssertionID acquired = kIOPMNullAssertionID;
++      const auto result = IOPMAssertionCreateWithName(
++          type, kIOPMAssertionLevelOn, reason, &acquired);
++      if (result == kIOReturnSuccess) assertion = acquired;
++      else LOG_WARN("Cannot acquire macOS idle-sleep assertion: {}", result);
++    } else if (!needed && assertion != kIOPMNullAssertionID) {
++      IOPMAssertionRelease(assertion);
++      assertion = kIOPMNullAssertionID;
++    }
++  }
++
++  void Apply(bool sharing, bool keep_awake) {
++    UpdateAssertion(system, sharing || keep_awake,
++        kIOPMAssertionTypePreventUserIdleSystemSleep,
++        CFSTR("CrossDesk system idle-sleep preference"));
++    UpdateAssertion(display, sharing && !keep_awake,
++        kIOPMAssertionTypePreventUserIdleDisplaySleep,
++        CFSTR("CrossDesk is sharing the desktop"));
++  }
++
++  void Stop() { Apply(false, false); }
+ #elif defined(__linux__) && !defined(__OHOS__)
+   BusConnection session;
+   dbus_uint32_t cookie = 0;
+@@ -228,11 +233,20 @@
+ 
+ ScreenSharingPower::ScreenSharingPower() : impl_(std::make_unique<Impl>()) {}
+ 
+-ScreenSharingPower::~ScreenSharingPower() { SetSharing(false); }
++ScreenSharingPower::~ScreenSharingPower() {
++#ifdef __APPLE__
++  impl_->Stop();
++#else
++  SetSharing(false);
++#endif
++}
+ 
+ void ScreenSharingPower::SetSharing(bool sharing) {
+   if (sharing_ == sharing) return;
+   sharing_ = sharing;
++#ifdef __APPLE__
++  impl_->Apply(sharing_, keep_awake_);
++#else
+   if (sharing) {
+     impl_->Start();
+     LOG_INFO("Requested display and system idle-sleep inhibition for screen sharing");
+@@ -240,6 +254,18 @@
+     impl_->Stop();
+     LOG_INFO("Released screen sharing power inhibitors");
+   }
++#endif
++}
++
++void ScreenSharingPower::SetKeepAwakeWhileRunning(bool enabled) {
++#ifdef __APPLE__
++  if (keep_awake_ == enabled) return;
++  keep_awake_ = enabled;
++  impl_->Apply(sharing_, keep_awake_);
++  LOG_INFO("Mac idle-sleep preference: {}", enabled);
++#else
++  (void)enabled;
++#endif
+ }
+ 
+ }  // namespace crossdesk
+diff --git a/apps/desktop/src/gui/features/devices/screen_sharing_power.h b/apps/desktop/src/gui/features/devices/screen_sharing_power.h
+--- a/apps/desktop/src/gui/features/devices/screen_sharing_power.h
++++ b/apps/desktop/src/gui/features/devices/screen_sharing_power.h
+@@ -21,11 +21,16 @@
+   ScreenSharingPower& operator=(const ScreenSharingPower&) = delete;
+ 
+   void SetSharing(bool sharing);
++  // macOS user opt-in: keep system awake while app is running, allow display idle.
++  void SetKeepAwakeWhileRunning(bool enabled);
+ 
+  private:
+   struct Impl;
+   std::unique_ptr<Impl> impl_;
+   bool sharing_ = false;
++#ifdef __APPLE__
++  bool keep_awake_ = false;
++#endif
+ };
+ 
+ }  // namespace crossdesk
+diff --git a/apps/desktop/src/gui/features/devices/session_device_manager.cpp b/apps/desktop/src/gui/features/devices/session_device_manager.cpp
+--- a/apps/desktop/src/gui/features/devices/session_device_manager.cpp
++++ b/apps/desktop/src/gui/features/devices/session_device_manager.cpp
+@@ -151,6 +151,10 @@
+ }
+ 
+ void SessionDeviceManager::Initialize() {
++#ifdef __APPLE__
++  screen_sharing_power_.SetKeepAwakeWhileRunning(
++      owner_.config_center_->IsKeepMacAwake());
++#endif
+   screen_capturer_factory_ = new ScreenCapturerFactory();
+   device_controller_factory_ = new DeviceControllerFactory();
+   keyboard_capturer_ =
+@@ -710,6 +714,10 @@
+ }
+ 
+ void SessionDeviceManager::UpdateInteractions() {
++#ifdef __APPLE__
++  screen_sharing_power_.SetKeepAwakeWhileRunning(
++      owner_.config_center_->IsKeepMacAwake());
++#endif
+   // Restore the previous session's modes and apply the new controller's saved
+   // selections before starting capture or allowing an early input return.
+   owner_.HandleDisplayResolutionChanges();
+@@ -900,6 +908,9 @@
+ }
+ 
+ void SessionDeviceManager::DestroyDevices() {
++#ifdef __APPLE__
++  screen_sharing_power_.SetKeepAwakeWhileRunning(false);
++#endif
+   owner_.screen_capturer_is_started_ = false;
+   screen_sharing_power_.SetSharing(false);
+   speaker_capture_.Shutdown();
+diff --git a/apps/desktop/src/gui/ui/main_window.slint b/apps/desktop/src/gui/ui/main_window.slint
+--- a/apps/desktop/src/gui/ui/main_window.slint
++++ b/apps/desktop/src/gui/ui/main_window.slint
+@@ -88,6 +88,7 @@
+     in-out property <string> privacy-black-screen: "Use a black privacy screen";
+     in-out property <string> privacy-on-connect: "Privacy screen on connect";
+     in-out property <string> lock-on-disconnect: "Lock screen on disconnect";
++    in-out property <string> keep-mac-awake: "Prevent system sleep (allow display off)";
+     in-out property <string> file-save-path: "File save path";
+     in-out property <string> default-desktop: "Desktop";
+     in-out property <string> server-host: "Server host";
+@@ -782,6 +783,8 @@
+     in-out property <bool> privacy-black-screen: false;
+     in property <bool> lock-on-disconnect-available: false;
+     in-out property <bool> lock-on-disconnect-enabled: true;
++    in property <bool> keep-mac-awake-available: false;
++    in-out property <bool> keep-mac-awake-enabled: false;
+     in-out property <bool> trusted-devices-only: false;
+     in-out property <bool> trusted-devices-open: false;
+     in property <[TrustedDeviceEntry]> trusted-devices;
+@@ -3057,13 +3060,14 @@
+                         }
+                         SettingsGroup {
+                             title: GalleryStrings.texts[120];
+-                            rows: 5 + (root.privacy-black-screen-available ? 1 : 0)
++                            rows: 5 + (root.keep-mac-awake-available ? 1 : 0) + (root.privacy-black-screen-available ? 1 : 0)
+                                 + (root.mac-permission-settings-visible ? 1 : 0)
+                                 + (root.portable-service-settings-visible ? 1 : 0);
+                             SettingsToggleRow { label: UiStrings.privacy-on-connect; checked <=> root.privacy-on-connect-enabled; enabled: root.privacy-setting-available; }
+                             if root.privacy-black-screen-available: SettingsToggleRow { label: UiStrings.privacy-black-screen; checked <=> root.privacy-black-screen; }
+                             SettingsToggleRow { label: UiStrings.privacy-local-unlock; checked <=> root.privacy-local-unlock-allowed; enabled: root.privacy-setting-available; }
+                             SettingsToggleRow { label: UiStrings.lock-on-disconnect; checked <=> root.lock-on-disconnect-enabled; enabled: root.lock-on-disconnect-available; }
++                            if root.keep-mac-awake-available: SettingsToggleRow { label: UiStrings.keep-mac-awake; checked <=> root.keep-mac-awake-enabled; }
+                             SettingsToggleRow { label: TrustStrings.only; checked <=> root.trusted-devices-only; }
+                             SettingsRow {
+                                 label: TrustStrings.title; divider: root.mac-permission-settings-visible || root.portable-service-settings-visible;
+diff --git a/apps/desktop/src/gui/ui/ui_localization.h b/apps/desktop/src/gui/ui/ui_localization.h
+--- a/apps/desktop/src/gui/ui/ui_localization.h
++++ b/apps/desktop/src/gui/ui/ui_localization.h
+@@ -157,6 +157,18 @@
+   strings.set_privacy_black_screen(Text(localization::privacy_black_screen[language]));
+   strings.set_privacy_on_connect(Text(localization::privacy_on_connect[language]));
+   strings.set_lock_on_disconnect(Text(localization::lock_on_disconnect[language]));
++  static constexpr const char* keep_mac_awake[] = {
++      "阻止系统休眠（允许屏幕熄灭）",
++      "Prevent system sleep (allow display off)",
++      "Не давать системе уснуть (экран может выключаться)",
++      "阻止系統休眠（允許螢幕熄滅）",
++      "システムのスリープを防止（画面消灯可）",
++      "시스템 절전 방지(화면 끄기 허용)",
++      "System-Ruhemodus verhindern (Display darf aus sein)",
++      "Empêcher la veille (écran éteint autorisé)",
++      "Evitar suspensión (permitir apagar pantalla)",
++      "Impedir repouso (permitir apagar a tela)"};
++  strings.set_keep_mac_awake(Text(keep_mac_awake[language]));
+   strings.set_file_save_path(
+       Text(localization::file_transfer_save_path[language]));
+   strings.set_default_desktop(Text(localization::default_desktop[language]));

@@ -1,0 +1,88 @@
+name: Mac Clipboard + Keep Awake installers
+on:
+  workflow_dispatch:
+  push:
+    branches: [release-1.7.7-keymap]
+    paths:
+      - '.github/workflows/desktop-clipboard10m.yml'
+permissions:
+  contents: read
+jobs:
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-26
+            architecture: arm64
+            script: pkg_arm64.sh
+          - arch: x64
+            runner: macos-26-intel
+            architecture: x86_64
+            script: pkg_x64.sh
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      VERSION_NUM: v1.7.7-1-20261124
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - name: Checkout pinned release with clarity patches
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          submodules: recursive
+      - name: Apply patches
+        shell: bash
+        run: |
+          git apply --check crossdesk-modifier-mapping.patch
+          git apply crossdesk-modifier-mapping.patch
+          git apply --check crossdesk-strict-clarity.patch
+          git apply crossdesk-strict-clarity.patch
+          git -C deps/submodules/minirtc apply --check ../../../minirtc-strict-clarity.patch
+          git -C deps/submodules/minirtc apply ../../../minirtc-strict-clarity.patch
+          git apply --check crossdesk-clipboard10m.patch
+          git apply crossdesk-clipboard10m.patch
+          git apply --check crossdesk-mac-keepawake.patch
+          git apply crossdesk-mac-keepawake.patch
+          git diff --check
+          git -C deps/submodules/minirtc diff --check
+      - name: Select Xcode 26.6
+        shell: bash
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+      - name: Cache Xmake dependencies
+        uses: actions/cache@v5
+        with:
+          path: ~/.xmake/packages
+          key: crossdesk-clarity-macos-${{ matrix.arch }}-deps-v1
+      - name: Ensure Xmake
+        uses: ./.github/actions/ensure-xmake
+        with:
+          minimum-version: "3.1.1"
+      - name: Update Xmake repos
+        run: xmake repo -u
+      - name: Build CrossDesk
+        run: |
+          xmake f -p macosx -a ${{ matrix.architecture }} -m release --target_minver=${MACOSX_DEPLOYMENT_TARGET} --CROSSDESK_VERSION=${VERSION_NUM} --USE_CUDA=false -vyD
+          xmake b -vy crossdesk
+      - name: Package ad-hoc signed app
+        run: |
+          bash apps/desktop/scripts/macos/${{ matrix.script }} "${VERSION_NUM}"
+          pkg="crossdesk-macos-${{ matrix.arch }}-${VERSION_NUM}.pkg"
+          verify="$(mktemp -d)"
+          pkgutil --expand-full "$pkg" "$verify/expanded"
+          app="$(find "$verify/expanded" -type d -name 'CrossDesk.app' -print -quit)"
+          test -n "$app"
+          codesign --verify --deep --strict "$app"
+          mv "$pkg" "CrossDesk-UltraClear-Clipboard10M-KeepAwake-v1.7.7-macos-${{ matrix.arch }}.pkg"
+          shasum -a 256 "CrossDesk-UltraClear-Clipboard10M-KeepAwake-v1.7.7-macos-${{ matrix.arch }}.pkg"
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: CrossDesk-UltraClear-Clipboard10M-KeepAwake-v1.7.7-macos-${{ matrix.arch }}
+          path: CrossDesk-UltraClear-Clipboard10M-KeepAwake-v1.7.7-macos-${{ matrix.arch }}.pkg
+          if-no-files-found: error
+          retention-days: 14
