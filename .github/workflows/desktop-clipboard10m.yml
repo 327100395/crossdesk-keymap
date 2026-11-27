@@ -1,6 +1,10 @@
 name: Ultra Clear + Clipboard 10 MiB installers
 on:
   workflow_dispatch:
+  push:
+    branches: [mcp]
+    paths:
+      - '.github/workflows/desktop-clipboard10m.yml'
 permissions:
   contents: read
 jobs:
